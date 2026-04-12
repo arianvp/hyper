@@ -209,6 +209,18 @@ impl Error {
         matches!(self.inner.kind, Kind::Canceled)
     }
 
+    /// Returns true if the dispatch task is gone.
+    ///
+    /// This occurs when the HTTP/2 connection task has exited (e.g. after
+    /// receiving a GOAWAY frame and draining accepted streams) while
+    /// requests were still queued in the dispatch channel. These requests
+    /// were never sent to the server and are safe to retry on a new
+    /// connection.
+    #[cfg(all(feature = "http2", feature = "client"))]
+    pub fn is_dispatch_gone(&self) -> bool {
+        matches!(self.inner.kind, Kind::User(User::DispatchGone))
+    }
+
     /// Returns true if a sender's channel is closed.
     pub fn is_closed(&self) -> bool {
         #[cfg(not(any(
@@ -740,5 +752,19 @@ mod tests {
     fn h2_go_away_reason_not_h2() {
         let err = Error::new_closed();
         assert_eq!(err.h2_go_away_reason(), None);
+    }
+
+    #[cfg(feature = "http2")]
+    #[test]
+    fn is_dispatch_gone_positive() {
+        let err = Error::new_user_dispatch_gone().with("runtime dropped the dispatch task");
+        assert!(err.is_dispatch_gone());
+    }
+
+    #[cfg(feature = "http2")]
+    #[test]
+    fn is_dispatch_gone_negative() {
+        let err = Error::new_canceled();
+        assert!(!err.is_dispatch_gone());
     }
 }
