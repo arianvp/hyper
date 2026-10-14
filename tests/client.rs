@@ -3244,6 +3244,39 @@ mod conn {
         assert!(got_rst, "server should receive RST_STREAM");
     }
 
+    #[tokio::test]
+    async fn h2_refused_stream_is_protocol_nack() {
+        let (client_io, server_io, _) = setup_duplex_test_server();
+
+        tokio::spawn(async move {
+            let mut h2 = h2::server::handshake(server_io).await.unwrap();
+            for reason in [h2::Reason::REFUSED_STREAM, h2::Reason::INTERNAL_ERROR] {
+                let (_req, mut respond) = h2.accept().await.unwrap().unwrap();
+                respond.send_reset(reason);
+            }
+            let _ = poll_fn(|cx| h2.poll_closed(cx)).await;
+        });
+
+        let io = TokioIo::new(client_io);
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
+            .handshake(io)
+            .await
+            .expect("http handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let get = || {
+            Request::get("http://localhost/")
+                .body(Empty::<Bytes>::new())
+                .unwrap()
+        };
+        let err = client.send_request(get()).await.expect_err("refused");
+        assert!(err.is_protocol_nack(), "{err:?}");
+        let err = client.send_request(get()).await.expect_err("reset");
+        assert!(!err.is_protocol_nack(), "{err:?}");
+    }
+
     // https://github.com/hyperium/hyper/issues/4003
     //
     // An idle `PipeToSendStream` must not reserve any connection-level flow

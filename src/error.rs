@@ -232,6 +232,29 @@ impl Error {
         matches!(self.inner.kind, Kind::Canceled)
     }
 
+    /// Returns true if the server refused the request without processing it.
+    ///
+    /// Such a request can safely be sent again, as described in
+    /// [RFC 9113 section 8.7]. With HTTP/2, this is the case when
+    ///
+    /// - the server reset the request's stream with `REFUSED_STREAM`, or
+    /// - the server sent a `GOAWAY` frame with a last stream identifier lower
+    ///   than the request's stream, or before the request could be sent.
+    ///
+    /// In the second case, the request has to go to a new connection.
+    ///
+    /// [RFC 9113 section 8.7]: https://www.rfc-editor.org/rfc/rfc9113#section-8.7
+    pub fn is_protocol_nack(&self) -> bool {
+        #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
+        if let Some(h2_err) = self.find_source::<h2::Error>() {
+            return h2_err.is_remote()
+                && (h2_err.is_go_away()
+                    || h2_err.is_reset() && h2_err.reason() == Some(h2::Reason::REFUSED_STREAM));
+        }
+
+        false
+    }
+
     /// Returns true if a sender's channel is closed.
     ///
     /// This can occur when the other side of a client or body channel
@@ -736,5 +759,15 @@ mod tests {
         // Suppose a user were proxying the received error
         let svc_err = Error::new_user_service(recvd);
         assert_eq!(svc_err.h2_reason(), h2::Reason::HTTP_1_1_REQUIRED);
+    }
+
+    #[cfg(feature = "http2")]
+    #[test]
+    fn is_protocol_nack_needs_the_peer() {
+        // Only errors received from the peer can be a NACK, h2 can't make
+        // those outside of a connection, see tests/client.rs for them.
+        let local = Error::new_h2(h2::Error::from(h2::Reason::REFUSED_STREAM));
+        assert!(!local.is_protocol_nack());
+        assert!(!Error::new_canceled().is_protocol_nack());
     }
 }
