@@ -680,6 +680,15 @@ where
             match ready!(self.h2_tx.poll_ready(cx)) {
                 Ok(()) => (),
                 Err(err) => {
+                    // Don't drop a request still waiting for its stream to
+                    // open, its caller would only learn that the dispatch
+                    // task is gone. Let it finish instead: with a response if
+                    // the server processed it, otherwise with the error h2
+                    // reports for its stream, such as the GOAWAY that
+                    // refused it.
+                    if let Some(f) = self.fut_ctx.take() {
+                        self.poll_pipe(f, cx);
+                    }
                     self.ping.ensure_not_timed_out()?;
                     return if err.reason() == Some(::h2::Reason::NO_ERROR) {
                         trace!("connection gracefully shutdown");

@@ -3244,6 +3244,55 @@ mod conn {
         assert!(got_rst, "server should receive RST_STREAM");
     }
 
+    // A request waiting for a stream to open when the server sends GOAWAY
+    // was never sent, it must fail with an error that says so instead of
+    // being dropped with the dispatch task.
+    #[tokio::test]
+    async fn h2_goaway_refuses_request_waiting_to_open() {
+        let (client_io, server_io, _) = setup_duplex_test_server();
+        let (accepted_tx, accepted_rx) = oneshot::channel::<()>();
+        let (goaway_tx, goaway_rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let mut builder = h2::server::Builder::new();
+            builder.max_concurrent_streams(1);
+            let mut h2 = builder.handshake::<_, Bytes>(server_io).await.unwrap();
+            let (_req, _respond) = h2.accept().await.unwrap().unwrap();
+            accepted_tx.send(()).unwrap();
+            goaway_rx.await.unwrap();
+            // Last stream ID 1: only the first request was accepted.
+            h2.abrupt_shutdown(h2::Reason::NO_ERROR);
+            let _ = poll_fn(|cx| h2.poll_closed(cx)).await;
+        });
+
+        let io = TokioIo::new(client_io);
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
+            .handshake(io)
+            .await
+            .expect("http handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let get = || {
+            Request::get("http://localhost/")
+                .body(Empty::<Bytes>::new())
+                .unwrap()
+        };
+        let first = tokio::spawn(client.send_request(get()));
+        accepted_rx.await.unwrap();
+        let second = tokio::spawn(client.send_request(get()));
+        // Let the connection task take the second request, which then waits
+        // for the server's only stream to be free.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        goaway_tx.send(()).unwrap();
+
+        let err = second.await.unwrap().expect_err("second request");
+        assert!(err.is_protocol_nack(), "{err:?}");
+        let err = first.await.unwrap().expect_err("first request");
+        assert!(!err.is_protocol_nack(), "{err:?}");
+    }
+
     #[tokio::test]
     async fn h2_refused_stream_is_protocol_nack() {
         let (client_io, server_io, _) = setup_duplex_test_server();
